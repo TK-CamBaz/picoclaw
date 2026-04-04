@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -958,6 +959,295 @@ func TestStripToolCallsJSON_OnlyToolCalls(t *testing.T) {
 	got := p.stripToolCallsJSON(text)
 	if got != "" {
 		t.Errorf("stripToolCallsJSON() = %q, want empty", got)
+	}
+}
+
+// --- hasMedia tests ---
+
+func TestHasMedia_NoMedia(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: "Hello"},
+		{Role: "assistant", Content: "Hi"},
+	}
+	if hasMedia(messages) {
+		t.Error("hasMedia() = true, want false for messages without media")
+	}
+}
+
+func TestHasMedia_WithMedia(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: "Look at this", Media: []string{"data:image/jpeg;base64,/9j/abc"}},
+	}
+	if !hasMedia(messages) {
+		t.Error("hasMedia() = false, want true for messages with media")
+	}
+}
+
+func TestHasMedia_EmptyMessages(t *testing.T) {
+	if hasMedia(nil) {
+		t.Error("hasMedia(nil) = true, want false")
+	}
+}
+
+func TestHasMedia_MediaOnLaterMessage(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: "First"},
+		{Role: "assistant", Content: "Response"},
+		{Role: "user", Content: "Second", Media: []string{"data:image/png;base64,abc"}},
+	}
+	if !hasMedia(messages) {
+		t.Error("hasMedia() = false, want true when media is on a later message")
+	}
+}
+
+// --- buildStreamJSONInput tests ---
+
+func TestBuildStreamJSONInput_WithImage(t *testing.T) {
+	p := NewClaudeCliProvider("/workspace")
+	messages := []Message{
+		{Role: "user", Content: "What is this?", Media: []string{"data:image/jpeg;base64,/9j/4AAQSkZJRgAB"}},
+	}
+
+	data, err := p.buildStreamJSONInput(messages)
+	if err != nil {
+		t.Fatalf("buildStreamJSONInput() error = %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	if result["type"] != "user" {
+		t.Errorf("type = %v, want user", result["type"])
+	}
+
+	msg, ok := result["message"].(map[string]any)
+	if !ok {
+		t.Fatal("message field missing or wrong type")
+	}
+	if msg["role"] != "user" {
+		t.Errorf("message.role = %v, want user", msg["role"])
+	}
+
+	content, ok := msg["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("content should have 2 blocks, got %v", msg["content"])
+	}
+
+	textBlock, ok := content[0].(map[string]any)
+	if !ok || textBlock["type"] != "text" {
+		t.Errorf("content[0] should be text block, got %v", content[0])
+	}
+	if textBlock["text"] != "What is this?" {
+		t.Errorf("text = %v, want 'What is this?'", textBlock["text"])
+	}
+
+	imageBlock, ok := content[1].(map[string]any)
+	if !ok || imageBlock["type"] != "image" {
+		t.Errorf("content[1] should be image block, got %v", content[1])
+	}
+
+	source, ok := imageBlock["source"].(map[string]any)
+	if !ok {
+		t.Fatal("image block missing source")
+	}
+	if source["type"] != "base64" {
+		t.Errorf("source.type = %v, want base64", source["type"])
+	}
+	if source["media_type"] != "image/jpeg" {
+		t.Errorf("source.media_type = %v, want image/jpeg", source["media_type"])
+	}
+	if source["data"] != "/9j/4AAQSkZJRgAB" {
+		t.Errorf("source.data = %v, want /9j/4AAQSkZJRgAB", source["data"])
+	}
+}
+
+func TestBuildStreamJSONInput_TextOnly(t *testing.T) {
+	p := NewClaudeCliProvider("/workspace")
+	messages := []Message{
+		{Role: "user", Content: "Hello"},
+	}
+
+	data, err := p.buildStreamJSONInput(messages)
+	if err != nil {
+		t.Fatalf("buildStreamJSONInput() error = %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	msg := result["message"].(map[string]any)
+	content := msg["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("content should have 1 block (text only), got %d", len(content))
+	}
+
+	block := content[0].(map[string]any)
+	if block["type"] != "text" {
+		t.Errorf("block type = %v, want text", block["type"])
+	}
+	if block["text"] != "Hello" {
+		t.Errorf("block text = %v, want Hello", block["text"])
+	}
+}
+
+func TestBuildStreamJSONInput_MalformedMediaSkipped(t *testing.T) {
+	p := NewClaudeCliProvider("/workspace")
+	messages := []Message{
+		{Role: "user", Content: "Check this", Media: []string{"not-a-data-url", "data:image/jpeg;base64,validdata"}},
+	}
+
+	data, err := p.buildStreamJSONInput(messages)
+	if err != nil {
+		t.Fatalf("buildStreamJSONInput() error = %v", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+
+	msg := result["message"].(map[string]any)
+	content := msg["content"].([]any)
+	// 1 text block + 1 valid image (malformed one skipped)
+	if len(content) != 2 {
+		t.Fatalf("content should have 2 blocks (1 text + 1 image), got %d", len(content))
+	}
+}
+
+// --- parseStreamJSONOutput tests ---
+
+func TestParseStreamJSONOutput_FindsResultLine(t *testing.T) {
+	output := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"Hello","session_id":"s1","usage":{"input_tokens":5,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
+
+	got, err := parseStreamJSONOutput(output)
+	if err != nil {
+		t.Fatalf("parseStreamJSONOutput() error = %v", err)
+	}
+	if !strings.Contains(got, `"type":"result"`) {
+		t.Errorf("result line does not contain type:result, got %q", got)
+	}
+	if !strings.Contains(got, "Hello") {
+		t.Errorf("result line missing content, got %q", got)
+	}
+}
+
+func TestParseStreamJSONOutput_NoResultLine(t *testing.T) {
+	output := `{"type":"assistant","message":{"role":"assistant","content":[]}}`
+
+	_, err := parseStreamJSONOutput(output)
+	if err == nil {
+		t.Fatal("parseStreamJSONOutput() expected error when no result line")
+	}
+	if !strings.Contains(err.Error(), "no result event") {
+		t.Errorf("error = %q, want to contain 'no result event'", err.Error())
+	}
+}
+
+func TestParseStreamJSONOutput_EmptyOutput(t *testing.T) {
+	_, err := parseStreamJSONOutput("")
+	if err == nil {
+		t.Fatal("parseStreamJSONOutput() expected error for empty output")
+	}
+}
+
+func TestParseStreamJSONOutput_SpacedTypeField(t *testing.T) {
+	output := `{"type": "result","result":"hi","session_id":"s"}`
+
+	got, err := parseStreamJSONOutput(output)
+	if err != nil {
+		t.Fatalf("parseStreamJSONOutput() error = %v", err)
+	}
+	if got == "" {
+		t.Error("should return the result line")
+	}
+}
+
+// --- TestChat_WithMedia_UsesStreamJSON ---
+
+func createStreamJSONArgCaptureCLI(t *testing.T, argsFile string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("mock CLI scripts not supported on Windows")
+	}
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "claude")
+	content := fmt.Sprintf(`#!/bin/sh
+echo "$@" > '%s'
+cat <<'EOFMOCK'
+{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I see an image."}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"I see an image.","session_id":"sess1","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+EOFMOCK
+`, argsFile)
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func TestChat_WithMedia_UsesStreamJSON(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	script := createStreamJSONArgCaptureCLI(t, argsFile)
+
+	p := NewClaudeCliProvider(t.TempDir())
+	p.command = script
+
+	resp, err := p.Chat(context.Background(), []Message{
+		{Role: "user", Content: "What is this?", Media: []string{"data:image/jpeg;base64,/9j/abc"}},
+	}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if resp.Content != "I see an image." {
+		t.Errorf("Content = %q, want %q", resp.Content, "I see an image.")
+	}
+
+	argsBytes, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read args file: %v", err)
+	}
+	args := string(argsBytes)
+	if !strings.Contains(args, "--input-format") {
+		t.Errorf("CLI args missing --input-format, got: %s", args)
+	}
+	if !strings.Contains(args, "stream-json") {
+		t.Errorf("CLI args missing stream-json, got: %s", args)
+	}
+	if !strings.Contains(args, "--output-format") {
+		t.Errorf("CLI args missing --output-format, got: %s", args)
+	}
+	if !strings.Contains(args, "--verbose") {
+		t.Errorf("CLI args missing --verbose, got: %s", args)
+	}
+}
+
+func TestChat_WithoutMedia_UsesPlainMode(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	script := createArgCaptureCLI(t, argsFile)
+
+	p := NewClaudeCliProvider(t.TempDir())
+	p.command = script
+
+	_, err := p.Chat(context.Background(), []Message{
+		{Role: "user", Content: "Hello"},
+	}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+
+	argsBytes, _ := os.ReadFile(argsFile)
+	args := string(argsBytes)
+	if strings.Contains(args, "stream-json") {
+		t.Errorf("CLI args should NOT use stream-json for text-only messages, got: %s", args)
+	}
+	if strings.Contains(args, "--verbose") {
+		t.Errorf("CLI args should NOT use --verbose for text-only messages, got: %s", args)
 	}
 }
 

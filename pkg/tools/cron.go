@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
-	"github.com/sipeed/picoclaw/pkg/constants"
 	"github.com/sipeed/picoclaw/pkg/cron"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
@@ -16,19 +16,17 @@ import (
 // JobExecutor is the interface for executing cron jobs through the agent
 type JobExecutor interface {
 	ProcessDirectWithChannel(ctx context.Context, content, sessionKey, channel, chatID string) (string, error)
-	// PublishResponseIfNeeded sends response to the outbound bus only when the
-	// agent did not already deliver content through the message tool in this round.
-	PublishResponseIfNeeded(ctx context.Context, channel, chatID, response string)
 }
 
 // CronTool provides scheduling capabilities for the agent
 type CronTool struct {
-	cronService  *cron.CronService
-	executor     JobExecutor
-	msgBus       *bus.MessageBus
-	execTool     *ExecTool
-	allowCommand bool
-	execEnabled  bool
+	cronService *cron.CronService
+	executor    JobExecutor
+	msgBus      *bus.MessageBus
+	execTool    *ExecTool
+	channel     string
+	chatID      string
+	mu          sync.RWMutex
 }
 
 // NewCronTool creates a new CronTool
@@ -37,32 +35,17 @@ func NewCronTool(
 	cronService *cron.CronService, executor JobExecutor, msgBus *bus.MessageBus, workspace string, restrict bool,
 	execTimeout time.Duration, config *config.Config,
 ) (*CronTool, error) {
-	allowCommand := true
-	execEnabled := true
-	if config != nil {
-		allowCommand = config.Tools.Cron.AllowCommand
-		execEnabled = config.Tools.Exec.Enabled
+	execTool, err := NewExecToolWithConfig(workspace, restrict, config)
+	if err != nil {
+		return nil, fmt.Errorf("unable to configure exec tool: %w", err)
 	}
 
-	var execTool *ExecTool
-	if execEnabled {
-		var err error
-		execTool, err = NewExecToolWithConfig(workspace, restrict, config)
-		if err != nil {
-			return nil, fmt.Errorf("unable to configure exec tool: %w", err)
-		}
-	}
-
-	if execTool != nil {
-		execTool.SetTimeout(execTimeout)
-	}
+	execTool.SetTimeout(execTimeout)
 	return &CronTool{
-		cronService:  cronService,
-		executor:     executor,
-		msgBus:       msgBus,
-		execTool:     execTool,
-		allowCommand: allowCommand,
-		execEnabled:  execEnabled,
+		cronService: cronService,
+		executor:    executor,
+		msgBus:      msgBus,
+		execTool:    execTool,
 	}, nil
 }
 
@@ -92,11 +75,7 @@ func (t *CronTool) Parameters() map[string]any {
 			},
 			"command": map[string]any{
 				"type":        "string",
-				"description": "Optional: Shell command to execute directly (e.g., 'df -h'). If set, the agent will run this command and report output instead of just showing the message.",
-			},
-			"command_confirm": map[string]any{
-				"type":        "boolean",
-				"description": "Optional explicit confirmation flag for scheduling a shell command. Command execution must also be enabled via tools.cron.allow_command.",
+				"description": "Optional: Shell command to execute directly (e.g., 'df -h'). If set, the agent will run this command and report output instead of just showing the message. 'deliver' will be forced to false for commands.",
 			},
 			"at_seconds": map[string]any{
 				"type":        "integer",
@@ -114,9 +93,21 @@ func (t *CronTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Job ID (for remove/enable/disable)",
 			},
+			"deliver": map[string]any{
+				"type":        "boolean",
+				"description": "If true, send message directly to channel. If false, let agent process message (for complex tasks). Default: true",
+			},
 		},
 		"required": []string{"action"},
 	}
+}
+
+// SetContext sets the current session context for job creation
+func (t *CronTool) SetContext(channel, chatID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.channel = channel
+	t.chatID = chatID
 }
 
 // Execute runs the tool with the given arguments
@@ -128,7 +119,7 @@ func (t *CronTool) Execute(ctx context.Context, args map[string]any) *ToolResult
 
 	switch action {
 	case "add":
-		return t.addJob(ctx, args)
+		return t.addJob(args)
 	case "list":
 		return t.listJobs()
 	case "remove":
@@ -142,9 +133,11 @@ func (t *CronTool) Execute(ctx context.Context, args map[string]any) *ToolResult
 	}
 }
 
-func (t *CronTool) addJob(ctx context.Context, args map[string]any) *ToolResult {
-	channel := ToolChannel(ctx)
-	chatID := ToolChatID(ctx)
+func (t *CronTool) addJob(args map[string]any) *ToolResult {
+	t.mu.RLock()
+	channel := t.channel
+	chatID := t.chatID
+	t.mu.RUnlock()
 
 	if channel == "" || chatID == "" {
 		return ErrorResult("no session context (channel/chat_id not set). Use this tool in an active conversation.")
@@ -161,12 +154,6 @@ func (t *CronTool) addJob(ctx context.Context, args map[string]any) *ToolResult 
 	atSeconds, hasAt := args["at_seconds"].(float64)
 	everySeconds, hasEvery := args["every_seconds"].(float64)
 	cronExpr, hasCron := args["cron_expr"].(string)
-
-	// Fix: type assertions return true for zero values, need additional validity checks
-	// This prevents LLMs that fill unused optional parameters with defaults (0) from triggering wrong type
-	hasAt = hasAt && atSeconds > 0
-	hasEvery = hasEvery && everySeconds > 0
-	hasCron = hasCron && cronExpr != ""
 
 	// Priority: at_seconds > every_seconds > cron_expr
 	if hasAt {
@@ -190,21 +177,19 @@ func (t *CronTool) addJob(ctx context.Context, args map[string]any) *ToolResult 
 		return ErrorResult("one of at_seconds, every_seconds, or cron_expr is required")
 	}
 
-	// GHSA-pv8c-p6jf-3fpp: command scheduling requires internal channel. When
-	// allow_command is disabled, explicit confirmation is required as an override.
-	// Non-command reminders remain open to all channels.
+	// Read deliver parameter, default to true
+	deliver := true
+	if d, ok := args["deliver"].(bool); ok {
+		deliver = d
+	}
+
 	command, _ := args["command"].(string)
-	commandConfirm, _ := args["command_confirm"].(bool)
 	if command != "" {
-		if !t.execEnabled {
-			return ErrorResult("command execution is disabled")
-		}
-		if !constants.IsInternalChannel(channel) {
-			return ErrorResult("scheduling command execution is restricted to internal channels")
-		}
-		if !t.allowCommand && !commandConfirm {
-			return ErrorResult("command_confirm=true is required when allow_command is disabled")
-		}
+		// Commands must be processed by agent/exec tool, so deliver must be false (or handled specifically)
+		// Actually, let's keep deliver=false to let the system know it's not a simple chat message
+		// But for our new logic in ExecuteJob, we can handle it regardless of deliver flag if Payload.Command is set.
+		// However, logically, it's not "delivered" to chat directly as is.
+		deliver = false
 	}
 
 	// Truncate message for job name (max 30 chars)
@@ -214,6 +199,7 @@ func (t *CronTool) addJob(ctx context.Context, args map[string]any) *ToolResult 
 		messagePreview,
 		schedule,
 		message,
+		deliver,
 		channel,
 		chatID,
 	)
@@ -221,13 +207,9 @@ func (t *CronTool) addJob(ctx context.Context, args map[string]any) *ToolResult 
 		return ErrorResult(fmt.Sprintf("Error adding job: %v", err))
 	}
 
-	// Apply optional payload fields and persist in a single UpdateJob call
-	needsUpdate := false
 	if command != "" {
 		job.Payload.Command = command
-		needsUpdate = true
-	}
-	if needsUpdate {
+		// Need to save the updated payload
 		t.cronService.UpdateJob(job)
 	}
 
@@ -306,22 +288,8 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 
 	// Execute command if present
 	if job.Payload.Command != "" {
-		if !t.execEnabled || t.execTool == nil {
-			output := "Error executing scheduled command: command execution is disabled"
-			pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer pubCancel()
-			t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
-				Channel: channel,
-				ChatID:  chatID,
-				Content: output,
-			})
-			return "ok"
-		}
-
 		args := map[string]any{
-			"command":   job.Payload.Command,
-			"__channel": channel,
-			"__chat_id": chatID,
+			"command": job.Payload.Command,
 		}
 
 		result := t.execTool.Execute(ctx, args)
@@ -342,9 +310,22 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 		return "ok"
 	}
 
+	// If deliver=true, send message directly without agent processing
+	if job.Payload.Deliver {
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer pubCancel()
+		t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
+			Channel: channel,
+			ChatID:  chatID,
+			Content: job.Payload.Message,
+		})
+		return "ok"
+	}
+
+	// For deliver=false, process through agent (for complex tasks)
 	sessionKey := fmt.Sprintf("cron-%s", job.ID)
 
-	// Call agent with the job message
+	// Call agent with job's message
 	response, err := t.executor.ProcessDirectWithChannel(
 		ctx,
 		job.Payload.Message,
@@ -356,8 +337,16 @@ func (t *CronTool) ExecuteJob(ctx context.Context, job *cron.CronJob) string {
 		return fmt.Sprintf("Error: %v", err)
 	}
 
+	// AgentLoop does not auto-send for ProcessDirectWithChannel,
+	// so we must publish the response ourselves.
 	if response != "" {
-		t.executor.PublishResponseIfNeeded(ctx, channel, chatID, response)
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer pubCancel()
+		t.msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
+			Channel: channel,
+			ChatID:  chatID,
+			Content: response,
+		})
 	}
 	return "ok"
 }

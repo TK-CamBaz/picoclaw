@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,15 @@ type replyTokenEntry struct {
 	timestamp time.Time
 }
 
+// pendingMediaEntry holds images sent in a group without @mention,
+// waiting to be attached to the next @mention message from the same user.
+type pendingMediaEntry struct {
+	mediaPaths []string
+	expiry     time.Time
+}
+
+const pendingMediaTTL = 180 * time.Second
+
 // LINEChannel implements the Channel interface for LINE Official Account
 // using the LINE Messaging API with HTTP webhook for receiving messages
 // and REST API for sending messages.
@@ -56,6 +66,7 @@ type LINEChannel struct {
 	botDisplayName string       // Bot's display name for text-based mention detection
 	replyTokens    sync.Map     // chatID -> replyTokenEntry
 	quoteTokens    sync.Map     // chatID -> quoteToken (string)
+	pendingMedia   sync.Map     // "chatID:userID" -> pendingMediaEntry
 	ctx            context.Context
 	cancel         context.CancelFunc
 }
@@ -349,9 +360,29 @@ func (c *LINEChannel) processEvent(event lineEvent) {
 		return
 	}
 
+	// Quick command: trigger knowledge review article
+	if strings.TrimSpace(content) == "複習知識" {
+		go c.handleKnowledgeReview(chatID)
+		return
+	}
+
 	// In group chats, apply unified group trigger filtering
 	if isGroup {
 		isMentioned := c.isBotMentioned(msg)
+
+		// Image without @mention: buffer for pendingMediaTTL, wait for next @mention
+		if msg.Type == "image" && !isMentioned && len(mediaPaths) > 0 {
+			key := chatID + ":" + senderID
+			c.pendingMedia.Store(key, pendingMediaEntry{
+				mediaPaths: mediaPaths,
+				expiry:     time.Now().Add(pendingMediaTTL),
+			})
+			logger.DebugCF("line", "Buffered group image, waiting for @mention", map[string]any{
+				"key": key,
+			})
+			return
+		}
+
 		respond, cleaned := c.ShouldRespondInGroup(isMentioned, content)
 		if !respond {
 			logger.DebugCF("line", "Ignoring group message by group trigger", map[string]any{
@@ -360,6 +391,25 @@ func (c *LINEChannel) processEvent(event lineEvent) {
 			return
 		}
 		content = cleaned
+
+		// @mention text: attach any pending image from the same user (reusable within TTL)
+		if isMentioned {
+			key := chatID + ":" + senderID
+			if v, ok := c.pendingMedia.Load(key); ok {
+				entry := v.(pendingMediaEntry)
+				if time.Now().Before(entry.expiry) {
+					mediaPaths = append(entry.mediaPaths, mediaPaths...)
+					logger.DebugCF("line", "Attached pending image to @mention message", map[string]any{
+						"key": key,
+					})
+				} else {
+					c.pendingMedia.Delete(key)
+					// Notify user that the buffered image has expired
+					_ = c.sendPush(c.ctx, chatID, "圖片已超過 3 分鐘等待時間，請重新傳送圖片後再 @我。", "")
+					return
+				}
+			}
+		}
 	}
 
 	metadata := map[string]string{
@@ -672,6 +722,26 @@ func (c *LINEChannel) callAPI(ctx context.Context, endpoint string, payload any)
 	}
 
 	return nil
+}
+
+// handleKnowledgeReview runs the knowledge review script and sends a status reply.
+func (c *LINEChannel) handleKnowledgeReview(chatID string) {
+	_ = c.sendPush(c.ctx, chatID, "正在為你準備今日知識複習，請稍候…", "")
+
+	cmd := exec.Command("bash", "/home/pi/.picoclaw/workspace/knowledge-review/send-review.sh")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.ErrorCF("line", "Knowledge review script failed", map[string]any{
+			"error":  err.Error(),
+			"output": string(output),
+		})
+		_ = c.sendPush(c.ctx, chatID, "知識複習產生失敗，請稍後再試。", "")
+		return
+	}
+
+	logger.InfoCF("line", "Knowledge review triggered manually", map[string]any{
+		"output": string(output),
+	})
 }
 
 // downloadContent downloads media content from the LINE API.

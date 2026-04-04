@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 )
@@ -27,7 +28,11 @@ func NewClaudeCliProvider(workspace string) *ClaudeCliProvider {
 func (p *ClaudeCliProvider) Chat(
 	ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]any,
 ) (*LLMResponse, error) {
-	systemPrompt := p.buildSystemPrompt(messages, tools)
+	if hasMedia(messages) {
+		return p.chatWithStreamJSON(ctx, messages, tools, model)
+	}
+
+	systemPrompt := p.buildSystemPrompt(messages, nil)
 	prompt := p.messagesToPrompt(messages)
 
 	args := []string{"-p", "--output-format", "json", "--dangerously-skip-permissions", "--no-chrome"}
@@ -65,6 +70,153 @@ func (p *ClaudeCliProvider) Chat(
 	}
 
 	return p.parseClaudeCliResponse(stdout.String())
+}
+
+// hasMedia returns true if any message contains media attachments.
+func hasMedia(messages []Message) bool {
+	for _, m := range messages {
+		if len(m.Media) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildStreamJSONInput serializes messages into a stream-json input line for claude CLI.
+// The last user message's Media are included as image content blocks.
+func (p *ClaudeCliProvider) buildStreamJSONInput(messages []Message) ([]byte, error) {
+	prompt := p.messagesToPrompt(messages)
+
+	// Collect media from the last user message
+	var mediaURLs []string
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && len(messages[i].Media) > 0 {
+			mediaURLs = messages[i].Media
+			break
+		}
+	}
+
+	type textBlock struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	type imageSource struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+	}
+	type imageBlock struct {
+		Type   string      `json:"type"`
+		Source imageSource `json:"source"`
+	}
+	type messageContent struct {
+		Role    string `json:"role"`
+		Content []any  `json:"content"`
+	}
+	type streamJSONInput struct {
+		Type    string         `json:"type"`
+		Message messageContent `json:"message"`
+	}
+
+	content := []any{textBlock{Type: "text", Text: prompt}}
+
+	for _, mediaURL := range mediaURLs {
+		parts := strings.SplitN(mediaURL, ",", 2)
+		if len(parts) != 2 {
+			log.Printf("claude_cli_provider: skipping malformed media URL (no comma): %q", mediaURL[:min(len(mediaURL), 80)])
+			continue
+		}
+		header := strings.TrimPrefix(parts[0], "data:")
+		headerParts := strings.SplitN(header, ";", 2)
+		if len(headerParts) != 2 || headerParts[1] != "base64" {
+			log.Printf("claude_cli_provider: skipping malformed media URL (bad header): %q", parts[0])
+			continue
+		}
+		mediaType := headerParts[0]
+		b64data := parts[1]
+		content = append(content, imageBlock{
+			Type: "image",
+			Source: imageSource{
+				Type:      "base64",
+				MediaType: mediaType,
+				Data:      b64data,
+			},
+		})
+	}
+
+	input := streamJSONInput{
+		Type: "user",
+		Message: messageContent{
+			Role:    "user",
+			Content: content,
+		},
+	}
+
+	return json.Marshal(input)
+}
+
+// chatWithStreamJSON executes claude CLI in stream-json mode to support image inputs.
+func (p *ClaudeCliProvider) chatWithStreamJSON(ctx context.Context, messages []Message, tools []ToolDefinition, model string) (*LLMResponse, error) {
+	systemPrompt := p.buildSystemPrompt(messages, nil)
+
+	inputJSON, err := p.buildStreamJSONInput(messages)
+	if err != nil {
+		return nil, fmt.Errorf("claude cli: failed to build stream-json input: %w", err)
+	}
+
+	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--no-chrome"}
+	if systemPrompt != "" {
+		args = append(args, "--system-prompt", systemPrompt)
+	}
+	if model != "" && model != "claude-code" {
+		args = append(args, "--model", model)
+	}
+
+	cmd := exec.CommandContext(ctx, p.command, args...)
+	if p.workspace != "" {
+		cmd.Dir = p.workspace
+	}
+	cmd.Stdin = bytes.NewReader(inputJSON)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if stderrStr := stderr.String(); stderrStr != "" {
+			return nil, fmt.Errorf("claude cli error: %s", stderrStr)
+		}
+		return nil, fmt.Errorf("claude cli error: %w", err)
+	}
+
+	resultLine, err := parseStreamJSONOutput(stdout.String())
+	if err != nil {
+		return nil, err
+	}
+
+	return p.parseClaudeCliResponse(resultLine)
+}
+
+// parseStreamJSONOutput finds the result event line from stream-json output.
+func parseStreamJSONOutput(output string) (string, error) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, `"type":"result"`) || strings.Contains(line, `"type": "result"`) {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("claude cli: no result event found in stream-json output")
+}
+
+// min returns the smaller of a and b.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // GetDefaultModel returns the default model identifier.

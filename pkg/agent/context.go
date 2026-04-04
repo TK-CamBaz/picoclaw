@@ -139,14 +139,17 @@ func (cb *ContextBuilder) BuildSystemPrompt() string {
 		parts = append(parts, bootstrapContent)
 	}
 
-	// Skills - show summary, AI can read full content with read_file tool
-	skillsSummary := cb.skillsLoader.BuildSkillsSummary()
-	if skillsSummary != "" {
-		parts = append(parts, fmt.Sprintf(`# Skills
-
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-
-%s`, skillsSummary))
+	// Skills - embed full content so the AI can follow skill instructions directly
+	allSkills := cb.skillsLoader.ListSkills()
+	if len(allSkills) > 0 {
+		var skillNames []string
+		for _, s := range allSkills {
+			skillNames = append(skillNames, s.Name)
+		}
+		skillsContent := cb.skillsLoader.LoadSkillsForContext(skillNames)
+		if skillsContent != "" {
+			parts = append(parts, "# Skills\n\n"+skillsContent)
+		}
 	}
 
 	// Memory context

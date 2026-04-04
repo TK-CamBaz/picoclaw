@@ -81,6 +81,9 @@ func NewPicoChannel(cfg config.PicoConfig, messageBus *bus.MessageBus) (*PicoCha
 	base := channels.NewBaseChannel("pico", cfg, messageBus, cfg.AllowFrom)
 
 	allowOrigins := cfg.AllowOrigins
+	if len(allowOrigins) == 0 {
+		logger.WarnC("pico", "allow_origins is not configured: WebSocket connections will be accepted from any Origin. Set allow_origins in config to restrict access.")
+	}
 	checkOrigin := func(r *http.Request) bool {
 		if len(allowOrigins) == 0 {
 			return true // allow all if not configured
